@@ -130,7 +130,7 @@ class Attention(nn.Module):
         return output
     
     
-class FeedForward(nn.Module):
+class FeedForward(nn.Module): # 3 layer MLP
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
         super().__init__()
         if hidden_dim is None:
@@ -144,6 +144,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+    
     
 
 class TransformerBlock(nn.Module):
@@ -165,8 +166,8 @@ class TransformerBlock(nn.Module):
             dropout=args.dropout,
         )
 
-    def forward(self, x, pos_cis, kv_cache=False):
-        h = x + self.attention(self.attention_norm(x), pos_cis, kv_cache)
+    def forward(self, x, pos_cos, pos_sin, kv_cache=False):
+        h = x + self.attention(self.attention_norm(x), pos_cos, pos_sin, kv_cache)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -191,8 +192,10 @@ class Transformer(PreTrainedModel):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
         self.tok_embeddings.weight = self.output.weight
-        pos_cis = precompute_pos_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
-        self.register_buffer("pos_cis", pos_cis, persistent=False)
+        
+        pos_cos, pos_sin = precompute_angles(self.params.dim // self.params.n_heads, self.params.max_seq_len)
+        self.register_buffer("pos_cos", pos_cos, persistent=False)
+        self.register_buffer("pos_sin", pos_sin, persistent=False)
 
         self.apply(self._init_weights)
 
@@ -225,9 +228,9 @@ class Transformer(PreTrainedModel):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        pos_cis = self.pos_cis[current_idx:current_idx + seqlen]
+        pos_cos, pos_sin = self.pos_cos[current_idx:current_idx + seqlen], self.pos_sin[current_idx:current_idx + seqlen]
         for idx, layer in enumerate(self.layers):
-            h = layer(h, pos_cis, kv_cache)
+            h = layer(h, pos_cos, pos_sin, kv_cache)
 
         h = self.norm(h)
 
