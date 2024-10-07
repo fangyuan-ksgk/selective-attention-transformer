@@ -39,12 +39,22 @@ def apply_rotary_emb(xq, xk, pos_cos, pos_sin):
         x_odd, x_even = x[..., ::2], x[..., 1::2]
         return torch.cat([-x_even, x_odd], dim=-1)
  
-    xq_cos = xq * pos_cos 
-    xq_sin = rotate_half(xq) * pos_sin 
+    # Check if xq and xk have an extra num_head dimension
+    if xq.dim() == 4:
+        # (b, seqlen, n_head, head_dim)
+        pos_cos_repeated = pos_cos.unsqueeze(0).unsqueeze(2).repeat_interleave(2, dim=-1)
+        pos_sin_repeated = pos_sin.unsqueeze(0).unsqueeze(2).repeat_interleave(2, dim=-1)
+    else:
+        # (b, seqlen, hidden_dim)
+        pos_cos_repeated = pos_cos.unsqueeze(0).repeat_interleave(2, dim=-1)
+        pos_sin_repeated = pos_sin.unsqueeze(0).repeat_interleave(2, dim=-1)
+    
+    xq_cos = xq * pos_cos_repeated
+    xq_sin = rotate_half(xq) * pos_sin_repeated
     xq_out = xq_cos + xq_sin
     
-    xk_cos = xk * pos_cos
-    xk_sin = rotate_half(xk) * pos_sin
+    xk_cos = xk * pos_cos_repeated
+    xk_sin = rotate_half(xk) * pos_sin_repeated
     xk_out = xk_cos + xk_sin
     
     return xq_out, xk_out
@@ -87,7 +97,7 @@ class Attention(nn.Module):
         mask = torch.triu(mask, diagonal=1) # mask is added to the raw attention score before softmax (logarithm scale, so we use a upper-triangle with -inf values)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
+    def forward(self, x: torch.Tensor, pos_cos: torch.Tensor, pos_sin: torch.Tensor, kv_cache=False):
         bsz, seqlen, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -96,7 +106,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, pos_cis)             
+        xq, xk = apply_rotary_emb(xq, xk, pos_cos, pos_sin)             
 
         if kv_cache and self.eval():
             if seqlen == 1 and all(cache is not None for cache in (self.k_cache, self.v_cache)):
@@ -154,7 +164,7 @@ class SelectiveAttention(nn.Module):
         mask = torch.triu(mask, diagonal=1) # mask is added to the raw attention score before softmax (logarithm scale, so we use a upper-triangle with -inf values)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
+    def forward(self, x: torch.Tensor, pos_cos: torch.Tensor, pos_sin: torch.Tensor, kv_cache=False):
         bsz, seqlen, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -163,7 +173,7 @@ class SelectiveAttention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, pos_cis)             
+        xq, xk = apply_rotary_emb(xq, xk, pos_cos, pos_sin)             
 
         if kv_cache and self.eval():
             if seqlen == 1 and all(cache is not None for cache in (self.k_cache, self.v_cache)):
