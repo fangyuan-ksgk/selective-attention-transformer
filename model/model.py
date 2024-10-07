@@ -34,7 +34,6 @@ def precompute_angles(dim: int, end: int, theta: float = 10000.0):
     return torch.cos(angles), torch.sin(angles)
 
 def apply_rotary_emb(xq, xk, pos_cos, pos_sin):
-    seq_len, dim = xq.shape[-2], xq.shape[-1]
     
     def rotate_half(x):
         x_odd, x_even = x[..., ::2], x[..., 1::2]
