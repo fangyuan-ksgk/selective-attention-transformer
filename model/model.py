@@ -204,25 +204,6 @@ class SelectiveAttention(nn.Module):
         output = self.resid_dropout(output)
         return output
     
-
-# Selective attention mechanism
-
-
-
-attn_logits = torch.einsum("bhnd,bhmd->bhnm", xq, xk) / math.sqrt(self.head_dim)
-causal_mask = torch.triu(torch.ones_like(attn_logits[0, 0]), diagonal=1).bool()
-attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
-
-S = attn_logits[:, :, 0]  # Select head 0
-S = F.relu(S)  # Only positive selection
-S[:, :, 0] = 0  # Do not mask <BOS>
-S = (1 - torch.eye(seqlen, device=S.device)[None, :, :]) * S  # Do not mask self
-S = torch.roll(S, 1, -2)
-S[:, :, 0, :] = 0  # Mask strictly in the future
-F = torch.cumsum(S, dim=-2)  # Accumulate
-attn_logits -= F[:, None]
-
-    
     
 class FeedForward(nn.Module): # 3 layer MLP
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
@@ -247,7 +228,8 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        # self.attention = Attention(args)
+        self.attention = SelectiveAttention(args)
 
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
