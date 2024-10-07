@@ -27,28 +27,56 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return pos_cis
+# Don't really like this RoPE implementation ... 
+
+import torch
+
+def precompute_angles(dim: int, end: int, theta: float = 10000.0):
+    angles = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(end, device=angles.device)
+    angles = torch.outer(t, angles).float() # Smart-ass operation to avoid extra dimension and broadcasting
+    return torch.cos(angles), torch.sin(angles)
+
+def apply_rotary_emb(xq, xk, pos_cos, pos_sin):
+    seq_len, dim = xq.shape[-2], xq.shape[-1]
+    
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        return torch.cat([-x2, x1], dim=-1)
+    
+    xq_cos = xq * pos_cos
+    xq_sin = xq * pos_sin
+    xq_out = xq_cos + rotate_half(xq_sin)
+    
+    xk_cos = xk * pos_cos
+    xk_sin = xk * pos_sin
+    xk_out = xk_cos + rotate_half(xk_sin)
+    
+    return xq_out, xk_out
 
 
-def apply_rotary_emb(xq, xk, pos_cis):
-    def unite_shape(pos_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        assert pos_cis.shape == (x.shape[1], x.shape[-1])
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return pos_cis.view(*shape)
+# def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
+#     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+#     t = torch.arange(end, device=freqs.device)  # type: ignore
+#     freqs = torch.outer(t, freqs).float()  # type: ignore
+#     pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+#     return pos_cis
 
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    pos_cis = unite_shape(pos_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+# def apply_rotary_emb(xq, xk, pos_cis):
+#     def unite_shape(pos_cis, x):
+#         ndim = x.ndim
+#         assert 0 <= 1 < ndim
+#         assert pos_cis.shape == (x.shape[1], x.shape[-1])
+#         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+#         return pos_cis.view(*shape)
+
+#     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+#     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+#     pos_cis = unite_shape(pos_cis, xq_)
+#     xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3)
+#     xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
+#     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor: # use to repeat kv_heads by n_rep
@@ -146,8 +174,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
     
-    
-    
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: LMConfig):
@@ -161,15 +187,12 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-        if args.use_moe:
-            self.feed_forward = MOEFeedForward(args)
-        else:
-            self.feed_forward = FeedForward(
-                dim=args.dim,
-                hidden_dim=args.hidden_dim,
-                multiple_of=args.multiple_of,
-                dropout=args.dropout,
-            )
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=args.hidden_dim,
+            multiple_of=args.multiple_of,
+            dropout=args.dropout,
+        )
 
     def forward(self, x, pos_cis, kv_cache=False):
         h = x + self.attention(self.attention_norm(x), pos_cis, kv_cache)
