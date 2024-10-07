@@ -98,7 +98,6 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, pos_cis)             
 
-        # 更高效的kv_cache实现
         if kv_cache and self.eval():
             if seqlen == 1 and all(cache is not None for cache in (self.k_cache, self.v_cache)):
                 xk = torch.cat((self.k_cache, xk), dim=1)
@@ -128,6 +127,101 @@ class Attention(nn.Module):
         output = self.wo(output)
         output = self.resid_dropout(output)
         return output
+    
+    
+class SelectiveAttention(nn.Module):
+    def __init__(self, args: LMConfig):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        assert args.n_heads % self.n_kv_heads == 0
+        self.n_local_heads = args.n_heads
+        self.n_local_kv_heads = self.n_kv_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # kv_heads is broadcastable to n_local_heads by repetition (!)
+        self.head_dim = args.dim // args.n_heads
+                
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.k_cache, self.v_cache = None, None
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+
+        # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf")) # Maximal Context Length (max_seq_len) Mask
+        mask = torch.triu(mask, diagonal=1) # mask is added to the raw attention score before softmax (logarithm scale, so we use a upper-triangle with -inf values)
+        self.register_buffer("mask", mask, persistent=False)
+
+    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
+        bsz, seqlen, _ = x.shape
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim) # heads split representation dimension
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, pos_cis)             
+
+        if kv_cache and self.eval():
+            if seqlen == 1 and all(cache is not None for cache in (self.k_cache, self.v_cache)):
+                xk = torch.cat((self.k_cache, xk), dim=1)
+                xv = torch.cat((self.v_cache, xv), dim=1)
+            self.k_cache, self.v_cache = xk, xv
+
+        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
+        xk = xk.transpose(1, 2) # (bs, n_local_kv_heads, seqlen, head_dim)
+        xv = xv.transpose(1, 2) # (bs, n_local_kv_heads, seqlen, head_dim)
+
+        if self.flash and seqlen != 1:
+            raise NotImplementedError
+        else:  
+            attn_logits = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim) # (bs, n_local_heads, seqlen, seqlen)
+            attn_logits = attn_logits + self.mask[:, :, :seqlen, :seqlen]  # (bs, n_local_heads, seqlen, seqlen)
+            
+            # Selective Attention Mechanism
+            S = attn_logits[:, 0]  # Select head 0 | (bs, seqlen, seqlen)
+            S = F.relu(S)  # Only positive selection | (bs, seqlen, seqlen)
+            S[..., 0] = 0  # Do not mask <BOS> | first token in sequence is not masked (beginning of sequence)
+            S = (1 - torch.eye(seqlen, device=S.device)[None, :, :]) * S  # Do not mask self | zero-out diagonal elements
+            S = torch.roll(S, 1, -2)  # each token is able to mask next token's attention (Key step)
+            S[..., 0, :] = 0 # roll operation creates redundant beginning mask, so we zero-out the first row
+            Selective_Mask = torch.cumsum(S, dim=-1)  # Accumulate selection mask for each token (decided by all its previous token's)
+            attn_logits -= Selective_Mask[:, None] # subtract accumulated selection matrix from attention logits
+            
+            scores = F.softmax(attn_logits.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
+
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
+    
+
+# Selective attention mechanism
+
+
+
+attn_logits = torch.einsum("bhnd,bhmd->bhnm", xq, xk) / math.sqrt(self.head_dim)
+causal_mask = torch.triu(torch.ones_like(attn_logits[0, 0]), diagonal=1).bool()
+attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
+
+S = attn_logits[:, :, 0]  # Select head 0
+S = F.relu(S)  # Only positive selection
+S[:, :, 0] = 0  # Do not mask <BOS>
+S = (1 - torch.eye(seqlen, device=S.device)[None, :, :]) * S  # Do not mask self
+S = torch.roll(S, 1, -2)
+S[:, :, 0, :] = 0  # Mask strictly in the future
+F = torch.cumsum(S, dim=-2)  # Accumulate
+attn_logits -= F[:, None]
+
     
     
 class FeedForward(nn.Module): # 3 layer MLP
