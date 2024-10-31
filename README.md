@@ -6,7 +6,7 @@ For more details, you can refer to the [arXiv paper](https://arxiv.org/pdf/2410.
 
 ## Overview
 
-The Selective Attention Transformer aims to improve the efficiency and effectiveness of attention mechanisms by selectively focusing on relevant parts of the input data. This implementation is based on the original paper by [Author(s) Name(s)](link-to-paper).
+The Selective Attention Transformer aims to improve the efficiency and effectiveness of attention mechanisms by selectively focusing on relevant parts of the input data. This implementation is based on the original paper by Yaniv Leviathan.
 
 ## Features
 
